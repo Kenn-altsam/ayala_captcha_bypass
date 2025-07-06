@@ -1,6 +1,7 @@
 import pandas as pd
 from datetime import datetime
 import os
+import time
 from dotenv import load_dotenv
 from captcha_bypass import solve_captcha, status
 import logging
@@ -11,7 +12,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 import psycopg2
-from urllib.parse import urlparse
+from selenium.common.exceptions import TimeoutException
 
 # Configure logging
 logging.basicConfig(
@@ -21,7 +22,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-MAX_COMPANIES = 200
 CSV_FILE = 'companies_data.csv'
 
 class TaxDataScraper:
@@ -40,6 +40,9 @@ class TaxDataScraper:
         try:
             if os.path.exists(CSV_FILE):
                 df = pd.read_csv(CSV_FILE)
+                # Убедимся, что колонка БИН имеет строковый тип, чтобы избежать проблем с ведущими нулями
+                if 'bin' in df.columns:
+                    df['bin'] = df['bin'].astype(str)
                 return df.to_dict('records')
             return []
         except Exception as e:
@@ -49,49 +52,41 @@ class TaxDataScraper:
     def save_to_csv(self):
         """Save data to CSV file"""
         try:
+            if not self.companies:
+                logger.info("No data to save to CSV.")
+                return
             df = pd.DataFrame(self.companies)
-            df.to_csv(CSV_FILE, index=False, encoding='utf-8')
-            logger.info(f"Data saved to {CSV_FILE}")
+            df.to_csv(CSV_FILE, index=False, encoding='utf-8-sig')  # utf-8-sig для корректного отображения в Excel
+            logger.info(f"Data for {len(self.companies)} companies saved to {CSV_FILE}")
         except Exception as e:
             logger.error(f"Error saving data to CSV: {e}")
             
     def init_browser(self):
         """Initialize browser"""
+        logger.info("Initializing browser...")
         options = webdriver.ChromeOptions()
+        # options.add_argument('--headless')  # Можно включить для работы в фоновом режиме
         options.add_argument('--start-maximized')
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
-        options.add_argument('--disable-gpu')
-        options.add_argument('--disable-notifications')
+        options.add_argument('--log-level=3')  # Убирает лишние логи Selenium
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
-        options.add_experimental_option('detach', True)  # Keep browser open for debugging
+
+        # Чтобы браузер не закрывался сразу (для отладки)
+        # options.add_experimental_option('detach', True)
+
         self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-        self.wait = WebDriverWait(self.driver, 30)  # Increase wait time to 30 seconds
+        self.wait = WebDriverWait(self.driver, 20)
+        logger.info("Browser initialized.")
         
     def close_browser(self):
         """Close browser and DB connection"""
-        if hasattr(self, 'driver'):
+        if hasattr(self, 'driver') and self.driver:
             self.driver.quit()
+            logger.info("Browser closed.")
         # Ensure we also close DB connection
         self.close_db()
         
-    def bypass_captcha(self):
-        """Handle captcha bypass using the existing tool"""
-        try:
-            iframe = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'iframe[title="reCAPTCHA"]')))
-            result = solve_captcha(self.driver, iframe)
-            
-            if result[0] == status.SUCCESS:
-                logger.info("Successfully bypassed captcha")
-                return True
-            else:
-                logger.error(f"Failed to bypass captcha: {result[0]}")
-                return False
-                
-        except Exception as e:
-            logger.error(f"Error during captcha bypass: {e}")
-            return False
-    
     def parse_money_value(self, value):
         """Convert string money value to float"""
         try:
@@ -101,86 +96,68 @@ class TaxDataScraper:
             
     def parse_date(self, date_str):
         """Convert date string to database format"""
-        if not date_str or date_str.strip() == '':
+        if not date_str or not date_str.strip():
             return None
         try:
             return datetime.strptime(date_str.strip(), '%d.%m.%Y').strftime('%Y-%m-%d')
         except ValueError:
             return None
             
-    def extract_company_data(self):
-        """Extract data from the first table"""
+    def extract_all_data(self):
+        """Извлекает данные о компании и налогах со страницы результатов."""
         try:
-            table = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'table.table-bordered')))
-            rows = table.find_elements(By.CSS_SELECTOR, 'tbody tr')
-            
+            # Ждем появления контейнера с результатами
+            self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'div.results')))
+
+            # --- Извлечение данных о компании (первая таблица) ---
+            info_table = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'table.table-bordered')))
+            rows = info_table.find_elements(By.CSS_SELECTOR, 'tbody tr')
             if not rows:
                 return None
-                
-            row = rows[0]  # We're interested in the first row
-            cells = row.find_elements(By.TAG_NAME, 'td')
-            
+
+            cells = rows[0].find_elements(By.TAG_NAME, 'td')
             company_data = {
-                'number': int(cells[0].text.strip()),
+                'bin': cells[4].text.strip(),
                 'name': cells[1].text.strip(),
                 'company_type': cells[2].text.strip(),
                 'rnn': cells[3].text.strip(),
-                'bin': cells[4].text.strip(),
                 'registered_at': self.parse_date(cells[5].text.strip())
             }
-            
-            # Initialize tax payment and VAT refund fields
+
+            # --- Извлечение данных о налогах (вторая таблица) ---
+            tax_table = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'table.table-taxpayment')))
+            tax_rows = tax_table.find_elements(By.CSS_SELECTOR, 'tbody tr')
+
+            # Инициализируем поля
             for year in range(2020, 2025):
                 company_data[f'tax_payment_{year}'] = 0.0
                 company_data[f'vat_refund_{year}'] = 0.0
-                
-            return company_data
-            
-        except Exception as e:
-            logger.error(f"Error extracting company data: {e}")
-            return None
-            
-    def extract_tax_data(self, bin_number):
-        """Extract tax payment data from the second table"""
-        try:
-            # Input BIN number and submit (field may be named `uin` on the site)
-            try:
-                bin_input = self.wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[name="uin"]')))
-            except:
-                bin_input = self.wait.until(EC.element_to_be_clickable((By.NAME, "bin")))
-            bin_input.clear()
-            bin_input.send_keys(bin_number)
-            self.driver.find_element(By.CSS_SELECTOR, 'button[type="submit"]').click()
-            
-            # Wait for and extract company data
-            company_data = self.extract_company_data()
-            if not company_data:
-                return None
-                
-            # Wait for the tax payments table
-            table = self.wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'table.table-taxpayment')))
-            rows = table.find_elements(By.CSS_SELECTOR, 'tbody tr')
-            
-            for row in rows:
+
+            for row in tax_rows:
                 cells = row.find_elements(By.TAG_NAME, 'td')
-                row_type = cells[0].text
-                
-                if row_type.strip() == 'Налоговые поступления':
-                    # Process tax payments for each year
-                    for year, cell in zip(range(2020, 2025), cells[1:6]):
-                        amount = self.parse_money_value(cell.text)
-                        company_data[f'tax_payment_{year}'] = amount
-                        
-                elif row_type.strip() == 'В т.ч. сумма возврата превышения НДС':
-                    # Process VAT refunds for each year
-                    for year, cell in zip(range(2020, 2025), cells[1:6]):
-                        amount = self.parse_money_value(cell.text)
-                        company_data[f'vat_refund_{year}'] = amount
-            
+                row_type = cells[0].text.strip()
+
+                if 'Налоговые поступления' in row_type:
+                    for year, cell in zip(range(2020, 2025), cells[1:]):
+                        company_data[f'tax_payment_{year}'] = self.parse_money_value(cell.text)
+                elif 'сумма возврата превышения НДС' in row_type:
+                    for year, cell in zip(range(2020, 2025), cells[1:]):
+                        company_data[f'vat_refund_{year}'] = self.parse_money_value(cell.text)
+
             return company_data
-            
+
+        except TimeoutException:
+            # Проверяем, не появилось ли сообщение "ничего не найдено"
+            try:
+                not_found_msg = self.driver.find_element(By.XPATH, "//*[contains(text(), 'По вашему запросу ничего не найдено')]")
+                if not_found_msg:
+                    logger.warning("Company not found on the portal.")
+                    return "NOT_FOUND"
+            except Exception:
+                logger.error("Timed out waiting for results, and no 'not found' message was detected.")
+                return None
         except Exception as e:
-            logger.error(f"Error extracting tax data for BIN {bin_number}: {e}")
+            logger.error(f"Error extracting data: {e}")
             return None
             
     def update_company_data(self, company_data):
@@ -192,44 +169,68 @@ class TaxDataScraper:
                 return
                 
         # Add new company if limit not reached
-        if len(self.companies) < MAX_COMPANIES:
-            self.companies.append(company_data)
-        else:
-            logger.warning(f"Maximum number of companies ({MAX_COMPANIES}) reached. Skipping new company.")
+        self.companies.append(company_data)
             
     def scrape_tax_data(self, bin_list):
         """Main function to scrape tax data"""
+        self.init_browser()
         try:
-            self.init_browser()
-            
             for bin_number in bin_list:
-                # Skip if we already have 200 companies and this is a new one
-                if len(self.companies) >= MAX_COMPANIES and not any(c['bin'] == bin_number for c in self.companies):
-                    logger.warning(f"Maximum number of companies ({MAX_COMPANIES}) reached. Skipping BIN: {bin_number}")
+                logger.info(f"--- Processing BIN: {bin_number} ---")
+                try:
+                    self.driver.get(self.url)
+
+                    # 1. Ввести БИН
+                    logger.info("Entering BIN...")
+                    bin_input = self.wait.until(EC.element_to_be_clickable((By.ID, "edit-uin-biniin-1")))
+                    bin_input.clear()
+                    bin_input.send_keys(bin_number)
+
+                    # 2. Решить капчу
+                    logger.info("Solving CAPTCHA...")
+                    captcha_result, _ = solve_captcha(self.driver)
+
+                    if captcha_result != status.SUCCESS:
+                        logger.error(f"Failed to solve CAPTCHA for BIN {bin_number}. Status: {captcha_result.name}")
+                        continue
+
+                    logger.info("CAPTCHA solved successfully.")
+
+                    # 3. Нажать кнопку "Поиск"
+                    logger.info("Clicking search button...")
+                    # Ждем, пока капча обработается и кнопка станет кликабельной
+                    time.sleep(2)
+                    search_button = self.wait.until(EC.element_to_be_clickable((By.ID, "edit-submit-1")))
+                    search_button.click()
+
+                    # 4. Извлечь данные
+                    logger.info("Extracting data from results page...")
+                    company_data = self.extract_all_data()
+
+                    if company_data and company_data != "NOT_FOUND":
+                        self.update_company_data(company_data)
+                        self.save_company_to_db(company_data)
+                        logger.info(f"Successfully processed and saved data for BIN: {bin_number}")
+                    elif company_data == "NOT_FOUND":
+                        logger.warning(f"No data found on the portal for BIN: {bin_number}")
+                    else:
+                        logger.error(f"Failed to extract data for BIN: {bin_number}")
+
+                    # Сохраняем в CSV после каждой успешной записи
+                    self.save_to_csv()
+
+                except Exception as e:
+                    logger.error(f"A critical error occurred while processing BIN {bin_number}: {e}")
+                    # Сделаем скриншот для отладки
+                    try:
+                        self.driver.save_screenshot(f'error_screenshot_{bin_number}.png')
+                    except Exception as ss_e:
+                        logger.error(f"Failed to save screenshot: {ss_e}")
                     continue
-                    
-                logger.info(f"Processing BIN: {bin_number}")
-                
-                # Navigate to the page
-                self.driver.get(self.url)
-                
-                # Handle captcha
-                if not self.bypass_captcha():
-                    continue
-                    
-                # Extract data
-                company_data = self.extract_tax_data(bin_number)
-                if company_data:
-                    self.update_company_data(company_data)
-                    # Persist straight to the database
-                    self.save_company_to_db(company_data)
-                    logger.info(f"Successfully processed BIN: {bin_number}")
-                    
-            # Save all data to CSV
-            self.save_to_csv()
-                
+
         finally:
             self.close_browser()
+            logger.info("Scraping process finished.")
 
     # ------------------------------------------------------------------
     # Database helpers
@@ -273,6 +274,7 @@ class TaxDataScraper:
             """
             self.cursor.execute(create_table_sql)
             self.conn.commit()
+            logger.info("Database connection initialized.")
         except Exception as e:
             logger.error(f"Error connecting to database: {e}")
             self.conn = None
@@ -309,6 +311,7 @@ class TaxDataScraper:
             """
             self.cursor.execute(upsert_sql, company_data)
             self.conn.commit()
+            logger.info(f"Data for BIN {company_data['bin']} saved to DB.")
         except Exception as e:
             logger.error(f"Error saving data to database: {e}")
             if self.conn:
@@ -320,6 +323,7 @@ class TaxDataScraper:
             self.cursor.close()
         if getattr(self, "conn", None):
             self.conn.close()
+        logger.info("Database connection closed.")
 
 def main():
     # Example BIN numbers

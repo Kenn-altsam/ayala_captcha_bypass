@@ -4,6 +4,7 @@
 #
 #	MIT License
 #
+# --- MODIFIED FOR KGD.GOV.KZ ---
 
 from enum import Enum
 from typing import Tuple
@@ -16,105 +17,82 @@ import os
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 class status(Enum):
     SUCCESS = 0
     UNKNOWN = 1
     RATELIMITED = 2
     TIMEOUT = 3
+    NO_CHALLENGE = 4  # Added status for when challenge is not needed
 
 class NotExistent(Exception):
-    """
-    This exception is used internally
-    """
     err = None
-
     def __init__(self, error, *args: object) -> None:
         super().__init__(*args)
         self.err = error
 
-def solve_captcha(driver, iframe, t=5):
-    """Solve the given captcha
+def solve_captcha(driver, t: int = 10):
+    """Solve the given captcha.
+    This version is adapted to handle cases where no audio challenge appears.
 
-#### Args:
-    `driver` (`WebDriver`): The Selenium WebDriver instance
-    `iframe` (`WebElement`): A reference to the captcha's iframe
-    `t` (`int`, optional): Page load timeout (in seconds). Defaults to 5.
+    Args:
+        driver (WebDriver): The Selenium WebDriver instance.
+        t (int, optional): Page load timeout in seconds. Defaults to 10.
 
-#### Returns:
-        `Tuple(int, str)`: Error code (0 on success) and the answer (empty if error)
+    Returns:
+        Tuple(status, str): A tuple containing the status and the recognized text (if any).
     """
 
-    ret = None
+    ret: Tuple[status, str] | None = None
     tmp_dir = tempfile.gettempdir()
     mp3_file = os.path.join(tmp_dir, "_tmp.mp3")
     wav_file = os.path.join(tmp_dir, "_tmp.wav")
     tmp_files = [mp3_file, wav_file]
-    wait = WebDriverWait(driver, 20)  # Increase wait time
+    wait = WebDriverWait(driver, t)
 
     try:
         print("Attempting to solve captcha...")
-        
-        # Wait for the reCAPTCHA iframe to be present
+
+        # Wait for the reCAPTCHA iframe to be present and switch to it
         print("Switching to reCAPTCHA iframe...")
+        iframe = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'iframe[title="reCAPTCHA"]')))
         driver.switch_to.frame(iframe)
         print("Successfully switched to reCAPTCHA iframe")
 
-        # Click the checkbox using JavaScript
+        # Click the checkbox
         print("Looking for checkbox...")
-        checkbox = wait.until(EC.presence_of_element_located((By.CLASS_NAME, "recaptcha-checkbox-border")))
-        print("Found checkbox, clicking with JavaScript...")
-        driver.execute_script("arguments[0].click();", checkbox)
-        time.sleep(3)  # Give more time for the checkbox animation
+        checkbox = wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "recaptcha-checkbox-border")))
+        checkbox.click()
         print("Clicked checkbox")
 
-        # Switch back to default content
-        print("Switching back to default content...")
+        # --- NEW LOGIC: Check if captcha is solved without a challenge ---
+        time.sleep(2)  # Wait for potential verification
+        try:
+            # Switch back to main content to check the response textarea
+            driver.switch_to.default_content()
+            response_textarea = driver.find_element(By.ID, "g-recaptcha-response")
+            if response_textarea.get_attribute('value'):
+                print("Captcha solved without a visual/audio challenge!")
+                return (status.SUCCESS, "Passed without challenge")
+        except NoSuchElementException:
+            # Expected if the check fails; continue to the audio challenge
+            print("Visual/audio challenge is required.")
+
+        # Ensure we are back to the main content before proceeding
         driver.switch_to.default_content()
-        print("Switched to default content")
+        # --- END OF NEW LOGIC ---
 
         # Wait for and switch to the challenge iframe
         print("Looking for challenge iframe...")
-        time.sleep(2)  # Wait for iframe to appear
-        
-        # Try different ways to find the challenge iframe
-        challenge_frame = None
-        try:
-            # Try by title
-            challenge_frame = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'iframe[title="recaptcha challenge"]')))
-        except:
-            try:
-                # Try by name pattern
-                challenge_frame = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'iframe[name^="c-"]')))
-            except:
-                try:
-                    # Try finding all iframes and checking each one
-                    iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                    for frame in iframes:
-                        try:
-                            if "challenge" in frame.get_attribute("title").lower():
-                                challenge_frame = frame
-                                break
-                        except:
-                            continue
-                except:
-                    pass
-        
-        if not challenge_frame:
-            print("Challenge iframe not found")
-            raise Exception("Challenge iframe not found")
-            
-        print("Found challenge iframe, switching...")
-        wait.until(EC.visibility_of(challenge_frame))  # Wait for iframe to be visible
+        challenge_frame = wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, 'iframe[title*="recaptcha challenge"]')))
         driver.switch_to.frame(challenge_frame)
         print("Switched to challenge iframe")
 
-        # Click audio button using JavaScript
+        # Click audio button
         print("Looking for audio button...")
-        audio_button = wait.until(EC.presence_of_element_located((By.ID, "recaptcha-audio-button")))
-        print("Found audio button, clicking with JavaScript...")
-        driver.execute_script("arguments[0].click();", audio_button)
-        time.sleep(2)  # Give more time for audio challenge to load
+        audio_button = wait.until(EC.element_to_be_clickable((By.ID, "recaptcha-audio-button")))
+        audio_button.click()
         print("Clicked audio button")
 
         # Get the download link
@@ -138,58 +116,65 @@ def solve_captcha(driver, iframe, t=5):
         AudioSegment.from_mp3(mp3_file).export(wav_file, format="wav")
         print("Converted to WAV")
 
-        # Using google's own api against them
+        # Recognize speech
         print("Recognizing speech...")
         recognizer = sr.Recognizer()
         with sr.AudioFile(wav_file) as source:
             recorded_audio = recognizer.listen(source)
-            text = recognizer.recognize_google(recorded_audio)
+            text = recognizer.recognize_google(recorded_audio, language="en-US")  # Specify language for better accuracy
         print(f"Recognized text: {text}")
 
         # Type out the answer
         print("Entering answer...")
         audio_response = wait.until(EC.presence_of_element_located((By.ID, "audio-response")))
         audio_response.send_keys(text)
-        time.sleep(2)  # Give more time for text input
+        time.sleep(1)
         print("Entered answer")
 
-        # Click verify using JavaScript
+        # Click verify
         print("Looking for verify button...")
-        verify_button = wait.until(EC.presence_of_element_located((By.ID, "recaptcha-verify-button")))
-        print("Found verify button, clicking with JavaScript...")
-        driver.execute_script("arguments[0].click();", verify_button)
-        time.sleep(3)  # Give more time for verification
+        verify_button = wait.until(EC.element_to_be_clickable((By.ID, "recaptcha-verify-button")))
+        verify_button.click()
+        time.sleep(2)
         print("Clicked verify button")
 
         ret = (status.SUCCESS, text)
 
-    except TimeoutError as e:
-        print(f"Timeout error: {e}")
-        ret = (status.TIMEOUT, "")
+    except TimeoutException:
+        # This can happen if the challenge was passed immediately after checkbox click
+        # Or if the page is too slow. We check the response again.
+        print("Timeout occurred. Checking if captcha was solved anyway...")
+        try:
+            driver.switch_to.default_content()
+            response_textarea = driver.find_element(By.ID, "g-recaptcha-response")
+            if response_textarea.get_attribute('value'):
+                print("Captcha was solved despite timeout.")
+                ret = (status.SUCCESS, "Passed after timeout check")
+            else:
+                print("Captcha not solved after timeout.")
+                ret = (status.TIMEOUT, "")
+        except Exception:
+            ret = (status.TIMEOUT, "")
 
     except NotExistent as e:
         print(f"Not existent error: {e}")
         ret = (e.err, "")
 
     except Exception as e:
-        print(f"Unexpected error: {e}")
+        print(f"An unexpected error occurred in solve_captcha: {e}")
         ret = (status.UNKNOWN, "")
 
     finally:
-        # Switch back to default content
         try:
-            print("Switching back to default content...")
             driver.switch_to.default_content()
-            print("Switched to default content")
-        except Exception as e:
-            print(f"Error switching to default content: {e}")
-            
-        print("Cleaning up temporary files...")
+        except Exception:
+            pass  # Ignore errors if already in default content
         __cleanup(tmp_files)
-        print("Cleanup complete")
-        return ret
+        return ret if ret is not None else (status.UNKNOWN, "")
+
 
 def __cleanup(files: list):
+    """Remove temporary files if they exist."""
     for x in files:
         if os.path.exists(x):
             os.remove(x)
