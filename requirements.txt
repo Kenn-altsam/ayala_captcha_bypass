@@ -1,8 +1,1 @@
-SpeechRecognition
-requests
-selenium
-pydub
-pandas
-python-dotenv
-psycopg2-binary
-webdriver-manager
+requests>=2.31.0 
